@@ -71,6 +71,7 @@ Interactive API documentation is available at `/api/docs` when the server is run
 Creates or updates an appointment.
 
 **Request Body:**
+
 ```json
 {
   "id": "string",
@@ -83,6 +84,7 @@ Creates or updates an appointment.
 ```
 
 **Response:**
+
 ```json
 {
   "status": "ok" | "ignored-stale"
@@ -90,6 +92,7 @@ Creates or updates an appointment.
 ```
 
 **Error Responses:**
+
 - `400 Bad Request`: Invalid data format or validation errors
 - `409 Conflict`: Time range overlaps with existing appointment
 
@@ -98,10 +101,12 @@ Creates or updates an appointment.
 Retrieves appointments.
 
 **Query Parameters:**
+
 - `org` (optional): Organization ID (defaults to "default")
 - `at` (optional): ISO timestamp to find appointments at a specific time. If omitted, returns the current state (latest active versions).
 
 **Response:**
+
 ```json
 [
   {
@@ -121,57 +126,64 @@ Retrieves appointments.
 
 ### Prerequisites
 
-- Node.js 18+ 
+- Node.js 18+
 - PostgreSQL 12+
 - Docker (optional, for database)
 
 ### Installation
 
 1. **Clone the repository:**
+
    ```bash
    git clone <repository-url>
    cd sesami
    ```
 
 2. **Install dependencies:**
+
    ```bash
    npm install
    ```
 
 3. **Set up the database:**
-   
+
    **Option A: Using Docker (Recommended)**
+
    ```bash
    docker-compose up -d
    ```
-   
+
    **Option B: Local PostgreSQL**
    - Create a database named `sesami`
    - Update connection details in environment variables
 
 4. **Environment Configuration:**
-   
+
    Copy the sample environment file:
+
    ```bash
    cp sample.env .env
    ```
-   
+
    Update `.env` with your database configuration:
+
    ```env
    DATABASE_URL=postgres://postgres:123@localhost:5432/sesami
    PORT=3000
    ```
 
 5. **Run database migrations:**
+
    ```bash
    npm run migration:up
    ```
 
 6. **Start the application:**
+
    ```bash
    # Development
    npm run start:dev
-   
+
    # Production
    npm run build
    npm run start:prod
@@ -271,3 +283,4 @@ The service provides comprehensive error handling:
 ## License
 
 This project is licensed under the UNLICENSED license.
+_Developed by **Saeed Gholami Gharibvand** as part of a technical assessment._

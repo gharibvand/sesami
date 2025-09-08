@@ -6,10 +6,10 @@ import { Appointment } from './entities/appointment.entity';
 
 describe('AppointmentsService', () => {
   let service: AppointmentsService;
-  let entityManager: jest.Mocked<EntityManager>;
+  let em: jest.Mocked<EntityManager>;
 
   beforeEach(async () => {
-    const mockEntityManager = {
+    const mockEm: Partial<jest.Mocked<EntityManager>> = {
       findOne: jest.fn(),
       find: jest.fn(),
       create: jest.fn(),
@@ -23,153 +23,215 @@ describe('AppointmentsService', () => {
         AppointmentsService,
         {
           provide: EntityManager,
-          useValue: mockEntityManager,
+          useValue: mockEm,
         },
       ],
     }).compile();
 
     service = module.get<AppointmentsService>(AppointmentsService);
-    entityManager = module.get(EntityManager);
+    em = module.get(EntityManager) as jest.Mocked<EntityManager>;
   });
 
   it('should be defined', () => {
     expect(service).toBeDefined();
   });
 
-  describe('upsert', () => {
-    const validDto = {
-      id: '1',
-      start: '2020-10-10 20:20',
-      end: '2020-10-10 20:30',
-      createdAt: '2020-09-02 14:23:12',
-      updatedAt: '2020-09-28 14:23:12',
-    };
+  const validDto = {
+    id: '1',
+    start: '2020-10-10 20:20',
+    end: '2020-10-10 20:30',
+    createdAt: '2020-09-02 14:23:12',
+    updatedAt: '2020-09-28 14:23:12',
+  };
 
-    it('should create a new appointment successfully', async () => {
-      entityManager.transactional.mockImplementation(async (callback) => {
-        entityManager.findOne.mockResolvedValue(null);
-        entityManager.create.mockReturnValue({} as any);
-        entityManager.persistAndFlush.mockResolvedValue(undefined);
-        return callback(entityManager);
+  describe('upsert', () => {
+    it('creates a new appointment (no current row)', async () => {
+      em.transactional.mockImplementation(async (cb: any) => {
+        em.findOne.mockResolvedValue(null as any);
+        (em.create as any).mockReturnValue({} as any);
+        em.persistAndFlush.mockResolvedValue(undefined as any);
+        return cb(em);
       });
 
-      const result = await service.upsert(validDto);
-
-      expect(result).toEqual({ status: 'ok' });
-      expect(entityManager.findOne).toHaveBeenCalledWith(
+      const res = await service.upsert(validDto);
+      expect(res).toEqual({ status: 'ok' });
+      expect(em.findOne).toHaveBeenCalledWith(
         Appointment,
         { orgId: 'default', externalId: '1' },
         { lockMode: LockMode.PESSIMISTIC_WRITE },
       );
+      expect(em.persistAndFlush).toHaveBeenCalled();
     });
 
-    it('should throw BadRequestException for invalid date format', async () => {
-      const invalidDto = { ...validDto, start: 'invalid-date' };
+    it('rejects invalid date format', async () => {
+      em.transactional.mockImplementation(async (cb: any) => cb(em));
 
-      await expect(service.upsert(invalidDto)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        service.upsert({ ...validDto, start: '2020-10-10 25:61' }),
+      ).rejects.toThrow(BadRequestException);
     });
 
-    it('should throw BadRequestException when start >= end', async () => {
-      const invalidDto = {
-        ...validDto,
-        start: '2020-10-10 20:30',
-        end: '2020-10-10 20:20',
-      };
+    it('rejects when start >= end', async () => {
+      em.transactional.mockImplementation(async (cb: any) => cb(em));
 
-      await expect(service.upsert(invalidDto)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        service.upsert({
+          ...validDto,
+          start: '2020-10-10 20:30',
+          end: '2020-10-10 20:20',
+        }),
+      ).rejects.toThrow(BadRequestException);
     });
 
-    it('should throw BadRequestException when createdAt > updatedAt', async () => {
-      const invalidDto = {
-        ...validDto,
-        createdAt: '2020-10-01 14:23:12',
-        updatedAt: '2020-09-28 14:23:12',
-      };
+    it('rejects when createdAt > updatedAt', async () => {
+      em.transactional.mockImplementation(async (cb: any) => cb(em));
 
-      await expect(service.upsert(invalidDto)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        service.upsert({
+          ...validDto,
+          createdAt: '2020-10-01 14:23:12',
+          updatedAt: '2020-09-28 14:23:12',
+        }),
+      ).rejects.toThrow(BadRequestException);
     });
 
-    it('should ignore stale updates', async () => {
-      const existingAppointment = {
+    it('ignores stale updates (same/older updatedAt)', async () => {
+      const current = {
         payloadUpdatedAt: new Date('2020-09-29 14:23:12'),
       } as Appointment;
 
-      entityManager.transactional.mockImplementation(async (callback) => {
-        entityManager.findOne.mockResolvedValue(existingAppointment);
-        return callback(entityManager);
+      em.transactional.mockImplementation(async (cb: any) => {
+        em.findOne.mockResolvedValue(current);
+        return cb(em);
       });
 
-      const result = await service.upsert(validDto);
-
-      expect(result).toEqual({ status: 'ignored-stale' });
+      const res = await service.upsert(validDto);
+      expect(res).toEqual({ status: 'ignored-stale' });
     });
 
-    it('should throw ConflictException for overlapping appointments', async () => {
-      entityManager.transactional.mockImplementation(async (callback) => {
-        entityManager.findOne.mockResolvedValue(null);
-        entityManager.create.mockReturnValue({} as any);
-        entityManager.persistAndFlush.mockRejectedValue({
+    it('applies newer update (LWW) and bumps version', async () => {
+      const newer = {
+        ...validDto,
+        start: '2020-10-10 21:00',
+        end: '2020-10-10 21:30',
+        updatedAt: '2020-09-28 14:24:12',
+      };
+      const current = {
+        id: 'db-uuid',
+        orgId: 'default',
+        externalId: '1',
+        start: new Date('2020-10-10 20:20'),
+        end: new Date('2020-10-10 20:30'),
+        payloadUpdatedAt: new Date('2020-09-28 14:23:12'),
+        version: 1,
+      } as any;
+
+      em.transactional.mockImplementation(async (cb: any) => {
+        em.findOne.mockResolvedValue(current);
+        em.persistAndFlush.mockResolvedValue(undefined as any);
+        return cb(em);
+      });
+
+      const res = await service.upsert(newer);
+      expect(res).toEqual({ status: 'ok' });
+      expect(em.persistAndFlush).toHaveBeenCalled();
+    });
+
+    it('throws ConflictException for overlap constraint', async () => {
+      em.transactional.mockImplementation(async (cb: any) => {
+        em.findOne.mockResolvedValue(null as any);
+        (em.create as any).mockReturnValue({} as any);
+        (em.persistAndFlush as any).mockRejectedValue({
           code: '23P01',
           message: 'no_overlap_per_org',
         });
-        return callback(entityManager);
+        return cb(em);
       });
 
       await expect(service.upsert(validDto)).rejects.toThrow(ConflictException);
     });
+
+    it('allows adjacency (handled at DB level)', async () => {
+      const a = {
+        ...validDto,
+        id: 'A',
+        start: '2020-10-10 10:00',
+        end: '2020-10-10 10:30',
+      };
+      const b = {
+        ...validDto,
+        id: 'B',
+        start: '2020-10-10 10:30',
+        end: '2020-10-10 11:00',
+      };
+
+      em.transactional.mockImplementationOnce(async (cb: any) => {
+        em.findOne.mockResolvedValue(null as any);
+        (em.create as any).mockReturnValue({} as any);
+        em.persistAndFlush.mockResolvedValue(undefined as any);
+        return cb(em);
+      });
+      await service.upsert(a);
+
+      em.transactional.mockImplementationOnce(async (cb: any) => {
+        em.findOne.mockResolvedValue(null as any);
+        (em.create as any).mockReturnValue({} as any);
+        em.persistAndFlush.mockResolvedValue(undefined as any);
+        return cb(em);
+      });
+      const res2 = await service.upsert(b);
+      expect(res2).toEqual({ status: 'ok' });
+    });
   });
 
   describe('list', () => {
-    it('should return all appointments for an organization', async () => {
-      const mockAppointments = [{ id: '1' }, { id: '2' }] as Appointment[];
-      entityManager.find.mockResolvedValue(mockAppointments);
+    it('returns all appointments for an organization when no "at"', async () => {
+      const rows = [{ id: '1' }, { id: '2' }] as Appointment[];
+      em.find.mockResolvedValue(rows);
 
-      const result = await service.list({ orgId: 'org1' });
+      const res = await service.list({ orgId: 'org1' });
+      expect(res).toEqual(rows);
+      expect(em.find).toHaveBeenCalledWith(Appointment, { orgId: 'org1' });
+    });
 
-      expect(result).toEqual(mockAppointments);
-      expect(entityManager.find).toHaveBeenCalledWith(Appointment, {
+    it('filters by "at" (start <= at < end)', async () => {
+      const rows = [{ id: 'x' }] as Appointment[];
+      em.find.mockResolvedValue(rows);
+
+      const at = '2020-10-10T20:25:00Z';
+      const res = await service.list({ orgId: 'org1', at });
+      expect(res).toEqual(rows);
+      expect(em.find).toHaveBeenCalledWith(Appointment, {
         orgId: 'org1',
+        start: { $lte: new Date(at) },
+        end: { $gt: new Date(at) },
       });
     });
 
-    it('should return appointments at a specific time', async () => {
-      const mockAppointments = [{ id: '1' }] as Appointment[];
-      entityManager.find.mockResolvedValue(mockAppointments);
-
-      const result = await service.list({
-        orgId: 'org1',
-        at: '2020-10-10T20:25:00Z',
-      });
-
-      expect(result).toEqual(mockAppointments);
-      expect(entityManager.find).toHaveBeenCalledWith(Appointment, {
-        orgId: 'org1',
-        start: { $lte: new Date('2020-10-10T20:25:00Z') },
-        end: { $gt: new Date('2020-10-10T20:25:00Z') },
-      });
-    });
-
-    it('should throw BadRequestException for invalid date in at parameter', async () => {
+    it('throws BadRequest for invalid "at"', async () => {
       await expect(
-        service.list({ orgId: 'org1', at: 'invalid-date' }),
+        service.list({ orgId: 'org1', at: 'invalid' }),
       ).rejects.toThrow(BadRequestException);
     });
 
-    it('should use default organization when orgId is not provided', async () => {
-      const mockAppointments = [] as Appointment[];
-      entityManager.find.mockResolvedValue(mockAppointments);
-
+    it('uses default organization when orgId omitted', async () => {
+      const rows = [] as Appointment[];
+      em.find.mockResolvedValue(rows);
       await service.list({});
+      expect(em.find).toHaveBeenCalledWith(Appointment, { orgId: 'default' });
+    });
 
-      expect(entityManager.find).toHaveBeenCalledWith(Appointment, {
-        orgId: 'default',
-      });
+    it('boundary check: at == start included, at == end excluded', async () => {
+      const start = '2020-10-10T10:00:00Z';
+      const end = '2020-10-10T10:30:00Z';
+
+      em.find.mockResolvedValueOnce([{ id: 'hit' }] as any);
+      const r1 = await service.list({ orgId: 'orgB', at: start });
+      expect(r1.length).toBe(1);
+
+      em.find.mockResolvedValueOnce([] as any);
+      const r2 = await service.list({ orgId: 'orgB', at: end });
+      expect(r2.length).toBe(0);
     });
   });
 });
