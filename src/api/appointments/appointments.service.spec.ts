@@ -9,13 +9,19 @@ describe('AppointmentsService', () => {
   let em: jest.Mocked<EntityManager>;
 
   beforeEach(async () => {
+    const mockConnection = {
+      execute: jest.fn().mockResolvedValue(undefined),
+    };
+
     const mockEm: Partial<jest.Mocked<EntityManager>> = {
       findOne: jest.fn(),
       find: jest.fn(),
       create: jest.fn(),
+      persist: jest.fn(),
       persistAndFlush: jest.fn(),
       flush: jest.fn(),
       transactional: jest.fn(),
+      getConnection: jest.fn().mockReturnValue(mockConnection),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -60,7 +66,8 @@ describe('AppointmentsService', () => {
         { orgId: 'default', externalId: '1' },
         { lockMode: LockMode.PESSIMISTIC_WRITE },
       );
-      expect(em.persistAndFlush).toHaveBeenCalled();
+      expect(em.persist).toHaveBeenCalled();
+      expect(em.flush).toHaveBeenCalled();
     });
 
     it('rejects invalid date format', async () => {
@@ -134,14 +141,15 @@ describe('AppointmentsService', () => {
 
       const res = await service.upsert(newer);
       expect(res).toEqual({ status: 'ok' });
-      expect(em.persistAndFlush).toHaveBeenCalled();
+      expect(em.persist).toHaveBeenCalled();
+      expect(em.flush).toHaveBeenCalled();
     });
 
     it('throws ConflictException for overlap constraint', async () => {
       em.transactional.mockImplementation(async (cb: any) => {
         em.findOne.mockResolvedValue(null as any);
         (em.create as any).mockReturnValue({} as any);
-        (em.persistAndFlush as any).mockRejectedValue({
+        (em.flush as any).mockRejectedValue({
           code: '23P01',
           message: 'no_overlap_per_org',
         });
@@ -189,7 +197,7 @@ describe('AppointmentsService', () => {
       const rows = [{ id: '1' }, { id: '2' }] as Appointment[];
       em.find.mockResolvedValue(rows);
 
-      const res = await service.list({ orgId: 'org1' });
+      const res = await service.list({ org: 'org1' });
       expect(res).toEqual(rows);
       expect(em.find).toHaveBeenCalledWith(Appointment, { orgId: 'org1' });
     });
@@ -199,7 +207,7 @@ describe('AppointmentsService', () => {
       em.find.mockResolvedValue(rows);
 
       const at = '2020-10-10T20:25:00Z';
-      const res = await service.list({ orgId: 'org1', at });
+      const res = await service.list({ org: 'org1', at });
       expect(res).toEqual(rows);
       expect(em.find).toHaveBeenCalledWith(Appointment, {
         orgId: 'org1',
@@ -210,7 +218,7 @@ describe('AppointmentsService', () => {
 
     it('throws BadRequest for invalid "at"', async () => {
       await expect(
-        service.list({ orgId: 'org1', at: 'invalid' }),
+        service.list({ org: 'org1', at: 'invalid' }),
       ).rejects.toThrow(BadRequestException);
     });
 
@@ -226,11 +234,11 @@ describe('AppointmentsService', () => {
       const end = '2020-10-10T10:30:00Z';
 
       em.find.mockResolvedValueOnce([{ id: 'hit' }] as any);
-      const r1 = await service.list({ orgId: 'orgB', at: start });
+      const r1 = await service.list({ org: 'orgB', at: start });
       expect(r1.length).toBe(1);
 
       em.find.mockResolvedValueOnce([] as any);
-      const r2 = await service.list({ orgId: 'orgB', at: end });
+      const r2 = await service.list({ org: 'orgB', at: end });
       expect(r2.length).toBe(0);
     });
   });

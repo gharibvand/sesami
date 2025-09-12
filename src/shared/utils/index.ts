@@ -1,41 +1,20 @@
 import { BadRequestException } from '@nestjs/common';
 import { ERROR_MESSAGES } from '../constants';
 
-export function parseTimestamp(timestamp: string): Date {
-  try {
-    let normalized = timestamp.trim();
-    if (!normalized.includes('T')) {
-      normalized = normalized.replace(' ', 'T');
-      const timePart = normalized.split('T')[1] ?? '';
-      const hasSeconds = /:\d{2}(?:\.|$)/.test(timePart);
-      if (!hasSeconds) {
-        normalized = normalized + ':00';
-      }
-      normalized = normalized + 'Z';
-    } else {
-      const hasTimezone = /[zZ]|[+\-]\d{2}:?\d{2}$/.test(normalized);
-      if (!hasTimezone) {
-        normalized = normalized + 'Z';
-      }
-    }
-
-    const date = new Date(normalized);
-
-    if (isNaN(date.getTime())) {
-      throw new BadRequestException(
-        `${ERROR_MESSAGES.INVALID_DATETIME}: ${timestamp}`,
-      );
-    }
-
-    return date;
-  } catch (error) {
-    if (error instanceof BadRequestException) {
-      throw error;
-    }
-    throw new BadRequestException(
-      `${ERROR_MESSAGES.INVALID_DATETIME}: ${timestamp}`,
-    );
+export function parseTimestamp(input?: string): Date | null {
+  if (!input) return null;
+  const s = input.trim();
+  if (/\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
   }
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(s)) {
+    const iso = s.replace(' ', 'T') + (s.length === 16 ? ':00Z' : 'Z');
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
 }
 
 export function validateAppointmentTimes(
@@ -58,4 +37,8 @@ export function isOverlapConstraintError(error: any): boolean {
     error?.code === '23P01' ||
     String(error?.message).includes('no_overlap_per_org')
   );
+}
+
+export async function sleep(ms: number) {
+  return new Promise((res) => setTimeout(res, ms));
 }

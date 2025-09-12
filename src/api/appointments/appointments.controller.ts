@@ -19,6 +19,6 @@ export class AppointmentsController {
 
   @Get()
   async find(@Query() query: FindAppointmentsDto) {
-    return await this.service.list({ orgId: query.org, at: query.at });
+    return await this.service.list(query);
   }
 }

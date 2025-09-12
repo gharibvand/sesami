@@ -227,18 +227,23 @@ describe('AppointmentsController (e2e)', () => {
     });
 
     it('GET without org returns default org data (after creating one without orgId)', async () => {
+      const uniqueId = uid();
+      const timestamp = Date.now();
       const p = {
-        id: `d1-${uid()}`,
-        start: '2099-01-01 09:00',
-        end: '2099-01-01 09:30',
-        createdAt: '2098-12-31 09:00',
-        updatedAt: '2098-12-31 09:00',
+        id: `d1-${uniqueId}`,
+        start: `2100-${String((timestamp % 12) + 1).padStart(2, '0')}-${String((timestamp % 28) + 1).padStart(2, '0')} 09:00`,
+        end: `2100-${String((timestamp % 12) + 1).padStart(2, '0')}-${String((timestamp % 28) + 1).padStart(2, '0')} 09:30`,
+        createdAt: '2099-12-31 09:00',
+        updatedAt: '2099-12-31 09:00',
       };
+
+      // Create appointment without orgId (uses default org)
       await request(app.getHttpServer())
         .post('/appointments')
         .send(p)
         .expect(200);
 
+      // Get appointments without org (should return default org data)
       const res = await request(app.getHttpServer())
         .get('/appointments')
         .expect(200);

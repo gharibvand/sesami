@@ -1,105 +1,185 @@
 import {
+  Injectable,
   BadRequestException,
   ConflictException,
-  Injectable,
 } from '@nestjs/common';
 import { EntityManager, LockMode } from '@mikro-orm/core';
 import { Appointment } from './entities/appointment.entity';
 import { AppointmentVersion } from './entities/appointment-version.entity';
 import { CreateAppointmentDto } from './dto/create-appointments.dto';
-import {
-  DEFAULT_ORG_ID,
-  ERROR_MESSAGES,
-  APPOINTMENT_STATUS,
-} from '../../shared';
-import {
-  parseTimestamp,
-  validateAppointmentTimes,
-  isOverlapConstraintError,
-} from '../../shared';
+import { FindAppointmentsDto } from './dto/find-appointments.dto';
+import { parseTimestamp, sleep } from '../../shared/utils';
+
+const PG_EXCLUSION_VIOLATION = '23P01';
+const PG_UNIQUE_VIOLATION = '23505';
+const PG_SERIALIZATION_FAILURE = '40001';
+const PG_DEADLOCK_DETECTED = '40P01';
+
+async function advisoryXactLock(em: EntityManager, key: string) {
+  await em
+    .getConnection()
+    .execute('select pg_advisory_xact_lock(hashtext(?))', [key]);
+}
 
 @Injectable()
 export class AppointmentsService {
   constructor(private readonly em: EntityManager) {}
 
-  async upsert(dto: CreateAppointmentDto) {
-    const orgId = dto.orgId ?? DEFAULT_ORG_ID;
-    const externalId = dto.id;
+  private validatePayload(dto: CreateAppointmentDto) {
+    const orgId = dto.orgId?.trim() || 'default';
 
     const start = parseTimestamp(dto.start);
     const end = parseTimestamp(dto.end);
     const createdAt = parseTimestamp(dto.createdAt);
     const updatedAt = parseTimestamp(dto.updatedAt);
 
-    validateAppointmentTimes(start, end, createdAt, updatedAt);
+    if (!start || !end || !createdAt || !updatedAt) {
+      throw new BadRequestException({
+        code: 'INVALID_DATE_FORMAT',
+        message:
+          'Invalid date format. Use ISO or "YYYY-MM-DD HH:mm[:ss]" (UTC assumed) for start, end, createdAt, updatedAt.',
+      });
+    }
+    if (start >= end) {
+      throw new BadRequestException({
+        code: 'INVALID_TIME_RANGE',
+        message: 'start must be strictly before end.',
+      });
+    }
+    if (createdAt > updatedAt) {
+      throw new BadRequestException({
+        code: 'INVALID_METADATA',
+        message: 'createdAt cannot be after updatedAt.',
+      });
+    }
 
-    return this.em.transactional(async (em) => {
-      const current = await em.findOne(
-        Appointment,
-        { orgId, externalId },
-        { lockMode: LockMode.PESSIMISTIC_WRITE },
-      );
+    return { orgId, start, end, createdAt, updatedAt };
+  }
 
-      if (current && updatedAt <= current.payloadUpdatedAt) {
-        return { status: APPOINTMENT_STATUS.IGNORED_STALE };
-      }
+  async upsert(dto: CreateAppointmentDto) {
+    const { orgId, start, end, createdAt, updatedAt } =
+      this.validatePayload(dto);
+    const externalId = dto.id;
 
-      const version = (current?.version ?? 0) + 1;
+    const maxRetries = 3;
+    let attempt = 0;
 
+    while (true) {
       try {
-        let row = current;
-        if (row) {
-          row.start = start;
-          row.end = end;
-          row.payloadCreatedAt = createdAt;
-          row.payloadUpdatedAt = updatedAt;
-          row.version = version;
-          await em.flush();
-        } else {
-          row = em.create(Appointment, {
-            orgId,
-            externalId,
+        return await this.em.transactional(async (tx) => {
+          await advisoryXactLock(tx, `${orgId}:${externalId}`);
+          const current = await tx.findOne(
+            Appointment,
+            { orgId, externalId },
+            { lockMode: LockMode.PESSIMISTIC_WRITE },
+          );
+
+          if (current && updatedAt <= current.payloadUpdatedAt) {
+            return { status: 'ignored-stale' as const };
+          }
+
+          if (!current) {
+            const created = tx.create(Appointment, {
+              orgId,
+              externalId,
+              start,
+              end,
+              payloadCreatedAt: createdAt,
+              payloadUpdatedAt: updatedAt,
+              version: 1,
+            });
+            tx.persist(created);
+
+            const v = tx.create(AppointmentVersion, {
+              appointment: created,
+              start,
+              end,
+              payloadCreatedAt: createdAt,
+              payloadUpdatedAt: updatedAt,
+              version: 1,
+            });
+            tx.persist(v);
+
+            await tx.flush();
+            return { status: 'ok' as const };
+          }
+
+          current.start = start;
+          current.end = end;
+          current.payloadCreatedAt = createdAt;
+          current.payloadUpdatedAt = updatedAt;
+          current.version = current.version + 1;
+
+          const v = tx.create(AppointmentVersion, {
+            appointment: current,
             start,
             end,
             payloadCreatedAt: createdAt,
             payloadUpdatedAt: updatedAt,
-            version,
+            version: current.version,
           });
-          await em.persistAndFlush(row);
-        }
+          tx.persist(v);
 
-        const ver = em.create(AppointmentVersion, {
-          appointment: row,
-          version,
-          start,
-          end,
-          payloadCreatedAt: createdAt,
-          payloadUpdatedAt: updatedAt,
+          await tx.flush();
+          return { status: 'ok' as const };
         });
-        await em.persistAndFlush(ver);
+      } catch (err: any) {
+        const code: string | undefined = err?.code;
 
-        return { status: APPOINTMENT_STATUS.OK };
-      } catch (e: any) {
-        if (isOverlapConstraintError(e)) {
-          throw new ConflictException(ERROR_MESSAGES.TIME_RANGE_NOT_AVAILABLE);
+        if (
+          code === PG_EXCLUSION_VIOLATION ||
+          err?.message?.includes('no_overlap_per_org')
+        ) {
+          throw new ConflictException({
+            code: 'TIME_RANGE_UNAVAILABLE',
+            message:
+              'Requested time range is not available (overlaps with an existing appointment in this organization).',
+          });
         }
-        throw e;
+
+        if (code === PG_UNIQUE_VIOLATION) {
+          if (attempt < maxRetries) {
+            attempt++;
+            await sleep(25 * Math.pow(2, attempt));
+            continue;
+          }
+        }
+
+        if (
+          code === PG_SERIALIZATION_FAILURE ||
+          code === PG_DEADLOCK_DETECTED
+        ) {
+          if (attempt < maxRetries) {
+            attempt++;
+            await sleep(50 * Math.pow(2, attempt));
+            continue;
+          }
+        }
+
+        throw err;
       }
-    });
+    }
   }
 
-  async list({ orgId, at }: { orgId?: string; at?: string }) {
-    const organizationId = orgId ?? DEFAULT_ORG_ID;
-    if (at) {
-      const t = new Date(at);
-      if (isNaN(t.getTime()))
-        throw new BadRequestException(ERROR_MESSAGES.INVALID_AT_PARAMETER);
-      return this.em.find(Appointment, {
-        orgId: organizationId,
-        start: { $lte: t },
-        end: { $gt: t },
+  async list(query: FindAppointmentsDto) {
+    const orgId = (query.org || 'default').trim();
+
+    if (!query.at) {
+      return this.em.find(Appointment, { orgId });
+    }
+
+    const at = parseTimestamp(query.at);
+    if (!at) {
+      throw new BadRequestException({
+        code: 'INVALID_DATE_FORMAT',
+        message: 'Invalid "at" date format. Use ISO or "YYYY-MM-DDTHH:mm:ssZ".',
       });
     }
-    return this.em.find(Appointment, { orgId: organizationId });
+
+    return this.em.find(Appointment, {
+      orgId,
+      start: { $lte: at },
+      end: { $gt: at },
+    });
   }
 }
